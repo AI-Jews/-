@@ -1,11 +1,14 @@
-# The big Hebrew model (DictaLM 12B) of the phone line, served from a GitHub Actions job.
-# The job pulls the model parts from this repository, starts llama.cpp, opens a quick tunnel (cloudflared) and publishes the tunnel address and a
-# one-time key on the `brain-state` branch, ENCRYPTED with the public key of the line's Cloudflare Worker (only the Worker can read it).
+# The AI of the Hebrew phone line, served from a GitHub Actions job: the big model (DictaLM 12B) and a Hebrew speech recognizer (ivrit.ai Whisper).
+# The job pulls the model parts from this repository, starts llama.cpp and the recognizer, opens two quick tunnels (cloudflared) and publishes the two
+# tunnel names and a one-time key on the `brain-state` branch, ENCRYPTED with the public key of the line's Cloudflare Worker (only the Worker can read it).
 # A job lives about six hours; before it ends it starts the next one, so there is always one running. Nothing secret is in this file or in its logs.
 name: brain
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/brain.yml']
   schedule:
     - cron: '23 */6 * * *'
 
@@ -44,7 +47,7 @@ jobs:
           echo "::add-mask::$KEY"
           echo "KEY=$KEY" >> "$GITHUB_ENV"
           docker run -d --name brain -p 8080:8080 -v /mnt/model:/models ghcr.io/ggml-org/llama.cpp:server \
-            -m /models/model.gguf --host 0.0.0.0 --port 8080 --api-key "$KEY" -c 1536 -t 4 -np 1 --no-webui
+            -m /models/model.gguf --host 0.0.0.0 --port 8080 --api-key "$KEY" -c 1536 -t 3 -np 1 --no-webui
           for i in $(seq 1 120); do
             if curl -fs http://127.0.0.1:8080/health > /dev/null; then echo "model is up after $((i * 5)) s"; exit 0; fi
             sleep 5
@@ -52,22 +55,66 @@ jobs:
           docker logs brain | tail -n 20
           exit 1
 
-      - name: Open the tunnel
+      - name: Start the speech recognizer
+        run: |
+          set -e
+          python3 -m venv "$HOME/venv"
+          "$HOME/venv/bin/pip" install --quiet faster-whisper
+          cat > "$HOME/stt.py" <<'PY'
+          import io, os, json
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from faster_whisper import WhisperModel
+          KEY = os.environ['KEY']
+          model = WhisperModel('ivrit-ai/whisper-large-v3-turbo-ct2', device='cpu', compute_type='int8', cpu_threads=2)
+          class H(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+              def do_POST(self):
+                  if self.headers.get('authorization') != 'Bearer ' + KEY:
+                      self.send_response(401); self.end_headers(); return
+                  n = int(self.headers.get('content-length', '0'))
+                  if n <= 0 or n > 5000000:
+                      self.send_response(400); self.end_headers(); return
+                  data = self.rfile.read(n)
+                  segs, info = model.transcribe(io.BytesIO(data), language='he', beam_size=1, vad_filter=True, condition_on_previous_text=False)
+                  text = ' '.join(s.text.strip() for s in segs).strip()
+                  body = json.dumps({'text': text, 'duration': info.duration}).encode()
+                  self.send_response(200); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(body)
+              def log_message(self, *a):
+                  pass
+          ThreadingHTTPServer(('0.0.0.0', 8090), H).serve_forever()
+          PY
+          nohup "$HOME/venv/bin/python" "$HOME/stt.py" > "$HOME/stt.log" 2>&1 &
+          for i in $(seq 1 120); do
+            if curl -fs http://127.0.0.1:8090/ > /dev/null; then echo "recognizer is up after $((i * 5)) s"; exit 0; fi
+            sleep 5
+          done
+          tail -n 20 "$HOME/stt.log"
+          exit 1
+
+      - name: Open the tunnels
         run: |
           set -e
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
-          nohup ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8080 > "$HOME/cf.log" 2>&1 &
-          for i in $(seq 1 60); do
-            URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$HOME/cf.log" | head -n 1 || true)
-            if [ -n "$URL" ]; then break; fi
-            sleep 2
-          done
-          test -n "$URL"
-          echo "::add-mask::$URL"
-          echo "TUNNEL=$URL" >> "$GITHUB_ENV"
+          nohup ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8080 > "$HOME/cf1.log" 2>&1 &
+          nohup ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8090 > "$HOME/cf2.log" 2>&1 &
+          name_of() {
+            for i in $(seq 1 60); do
+              N=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$1" | head -n 1 | sed 's#https://##; s#\.trycloudflare\.com##' || true)
+              if [ -n "$N" ]; then echo "$N"; return 0; fi
+              sleep 2
+            done
+            return 1
+          }
+          LM=$(name_of "$HOME/cf1.log"); STT=$(name_of "$HOME/cf2.log")
+          test -n "$LM" && test -n "$STT"
+          echo "::add-mask::$LM"
+          echo "::add-mask::$STT"
+          echo "LM=$LM" >> "$GITHUB_ENV"
+          echo "STT=$STT" >> "$GITHUB_ENV"
 
-      - name: Publish the address, encrypted for the Worker
+      - name: Publish the addresses, encrypted for the Worker
         run: |
           set -e
           cat > pub.pem <<'PEM'
@@ -81,27 +128,23 @@ jobs:
           twIDAQAB
           -----END PUBLIC KEY-----
           PEM
-          printf '{"u":"%s","k":"%s","t":%s}' "$TUNNEL" "$KEY" "$(date +%s%3N)" > payload.json
+          printf '{"u":"%s","s":"%s","k":"%s","t":%s}' "$LM" "$STT" "$KEY" "$(date +%s%3N)" > payload.json
           openssl pkeyutl -encrypt -pubin -inkey pub.pem -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 -in payload.json | base64 -w0 > endpoint.txt
           rm -f payload.json
           # the brain-state branch (made from main the first time) holds one small file
           if ! gh api "repos/$REPO/git/ref/heads/brain-state" > /dev/null 2>&1; then
             gh api -X POST "repos/$REPO/git/refs" -f ref=refs/heads/brain-state -f sha="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)" > /dev/null
           fi
-          publish() {
-            SHA=$(gh api "repos/$REPO/contents/endpoint.txt?ref=brain-state" --jq .sha 2> /dev/null || true)
-            gh api -X PUT "repos/$REPO/contents/endpoint.txt" -f message="endpoint" -f content="$(base64 -w0 endpoint.txt)" -f branch=brain-state ${SHA:+-f sha="$SHA"} > /dev/null
-          }
-          publish
+          SHA=$(gh api "repos/$REPO/contents/endpoint.txt?ref=brain-state" --jq .sha 2> /dev/null || true)
+          gh api -X PUT "repos/$REPO/contents/endpoint.txt" -f message="endpoint" -f content="$(base64 -w0 endpoint.txt)" -f branch=brain-state ${SHA:+-f sha="$SHA"} > /dev/null
           echo "published"
-          # keep it fresh: the Worker accepts an address for seven hours
           echo "STARTED=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Keep serving, and start the next job before this one ends
         run: |
           set -e
-          END=$((STARTED + 20400))   # five hours and forty minutes
-          NEXT=$((END - 900))   # the next job needs about ten minutes to load the model
+          END=$((STARTED + 19800))   # five hours and thirty minutes
+          NEXT=$((END - 1200))       # the next job needs about fifteen minutes to be ready
           started_next=0
           while [ "$(date +%s)" -lt "$END" ]; do
             if [ "$started_next" = 0 ] && [ "$(date +%s)" -ge "$NEXT" ]; then
@@ -109,6 +152,7 @@ jobs:
               started_next=1
             fi
             curl -fs http://127.0.0.1:8080/health > /dev/null || { echo "model stopped"; exit 1; }
+            curl -fs http://127.0.0.1:8090/ > /dev/null || { echo "recognizer stopped"; exit 1; }
             sleep 60
           done
           if [ "$started_next" = 0 ]; then gh workflow run brain.yml -R "$REPO" || true; fi
