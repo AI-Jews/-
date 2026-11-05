@@ -1,0 +1,114 @@
+# The big Hebrew model (DictaLM 12B) of the phone line, served from a GitHub Actions job.
+# The job pulls the model parts from this repository, starts llama.cpp, opens a quick tunnel (cloudflared) and publishes the tunnel address and a
+# one-time key on the `brain-state` branch, ENCRYPTED with the public key of the line's Cloudflare Worker (only the Worker can read it).
+# A job lives about six hours; before it ends it starts the next one, so there is always one running. Nothing secret is in this file or in its logs.
+name: brain
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */6 * * *'
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      MODEL_DIR: dictalm-3.0-nemotron-12b-q4km
+    steps:
+      - name: Pull the model from this repository
+        run: |
+          set -e
+          BASE="https://raw.githubusercontent.com/$REPO/main/$MODEL_DIR"
+          mkdir -p "$HOME/parts" && cd "$HOME/parts"
+          curl -fsSL --retry 5 "$BASE/manifest.txt" -o manifest.txt
+          tail -n +2 manifest.txt | tr -d '\r' | awk '{print $1" "$2}' > parts.txt
+          echo "$(wc -l < parts.txt) parts"
+          # eight at a time; every part is checked against the manifest
+          xargs -P 8 -L 1 sh -c 'curl -fsS --retry 5 "$0/$2" -o "$2" && echo "$1  $2" | sha256sum -c --quiet' "$BASE" < parts.txt
+          sudo mkdir -p /mnt/model && sudo chown "$USER" /mnt/model
+          cut -d' ' -f2 parts.txt | xargs cat > /mnt/model/model.gguf
+          rm -rf "$HOME/parts"
+          ls -l /mnt/model/model.gguf
+
+      - name: Start the model
+        run: |
+          set -e
+          KEY=$(openssl rand -hex 16)
+          echo "::add-mask::$KEY"
+          echo "KEY=$KEY" >> "$GITHUB_ENV"
+          docker run -d --name brain -p 8080:8080 -v /mnt/model:/models ghcr.io/ggml-org/llama.cpp:server \
+            -m /models/model.gguf --host 0.0.0.0 --port 8080 --api-key "$KEY" -c 1536 -t 4 -np 1 --no-webui
+          for i in $(seq 1 120); do
+            if curl -fs http://127.0.0.1:8080/health > /dev/null; then echo "model is up after $((i * 5)) s"; exit 0; fi
+            sleep 5
+          done
+          docker logs brain | tail -n 20
+          exit 1
+
+      - name: Open the tunnel
+        run: |
+          set -e
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8080 > "$HOME/cf.log" 2>&1 &
+          for i in $(seq 1 60); do
+            URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$HOME/cf.log" | head -n 1 || true)
+            if [ -n "$URL" ]; then break; fi
+            sleep 2
+          done
+          test -n "$URL"
+          echo "::add-mask::$URL"
+          echo "TUNNEL=$URL" >> "$GITHUB_ENV"
+
+      - name: Publish the address, encrypted for the Worker
+        run: |
+          set -e
+          cat > pub.pem <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApaKVNClRvH7FpeTMMn1I
+          pbGPLPj/ve8ANV9ZV3dIeOmBjUlw5sebVLzdzZhLezZhWuahTjvBeSbOFjeWxq1u
+          EcNXA9rYnq+BJGw2lHVMX24tJQOZXhuiWcSyEbusxWS8FdQsMYWCxDzruy2WWw8i
+          aZDjLrPo6+y3dR+Uq56W9M3ZJnRNJur+kwWDa/GjyNKqzrul2yHYdLomKkJwxeiI
+          ir0fef2vCK8Gpv1pTRTMAK67/UFUgA8Fa6aRVcY03iWMADWGXDB+hLosZNkshzQz
+          i+djbiw6OUidD2G6NY93b9qYdDmz6FtCUp4T2bwDeWOhzxZ2ovs6jFUFIMX/zfZB
+          twIDAQAB
+          -----END PUBLIC KEY-----
+          PEM
+          printf '{"u":"%s","k":"%s","t":%s}' "$TUNNEL" "$KEY" "$(date +%s%3N)" > payload.json
+          openssl pkeyutl -encrypt -pubin -inkey pub.pem -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 -in payload.json | base64 -w0 > endpoint.txt
+          rm -f payload.json
+          # the brain-state branch (made from main the first time) holds one small file
+          if ! gh api "repos/$REPO/git/ref/heads/brain-state" > /dev/null 2>&1; then
+            gh api -X POST "repos/$REPO/git/refs" -f ref=refs/heads/brain-state -f sha="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)" > /dev/null
+          fi
+          publish() {
+            SHA=$(gh api "repos/$REPO/contents/endpoint.txt?ref=brain-state" --jq .sha 2> /dev/null || true)
+            gh api -X PUT "repos/$REPO/contents/endpoint.txt" -f message="endpoint" -f content="$(base64 -w0 endpoint.txt)" -f branch=brain-state ${SHA:+-f sha="$SHA"} > /dev/null
+          }
+          publish
+          echo "published"
+          # keep it fresh: the Worker accepts an address for seven hours
+          echo "STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Keep serving, and start the next job before this one ends
+        run: |
+          set -e
+          END=$((STARTED + 20400))   # five hours and forty minutes
+          NEXT=$((END - 900))   # the next job needs about ten minutes to load the model
+          started_next=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            if [ "$started_next" = 0 ] && [ "$(date +%s)" -ge "$NEXT" ]; then
+              gh workflow run brain.yml -R "$REPO" || true
+              started_next=1
+            fi
+            curl -fs http://127.0.0.1:8080/health > /dev/null || { echo "model stopped"; exit 1; }
+            sleep 60
+          done
+          if [ "$started_next" = 0 ]; then gh workflow run brain.yml -R "$REPO" || true; fi
